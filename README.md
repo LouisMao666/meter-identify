@@ -1,4 +1,3 @@
-# meter-identify
 manual meter reading is still necessary. In order to achieve automatic recognition of old mechanical water meters, a DL (deep learning) algorithm has been proposed.
 
 本方案将任务拆解为两个子任务：
@@ -331,6 +330,498 @@ class RandomCropData():
 
         return 0, 0, w, h
 ```
+
+### 构造文本区域二值图（DB论文中的 probability map），以及用于计算loss的mask
+
+这段代码是一个名为 `MakeSegDetectionData` 的类，用于构造文本区域的二值图（DB 论文中的 probability map）以及用于计算损失的 mask。让我们逐步分析这段代码：
+
+1. `__init__` 方法：
+   - 初始化函数，用于设置构造二值图的参数。
+   - 接受两个参数 `min_text_size` 和 `shrink_ratio`，分别表示文本区域的最小尺寸和收缩比例。
+   - 将这些参数存储为类属性。
+
+2. `process` 方法：
+   - 接受一个数据字典作为输入，其中包含图像、多边形标注等信息。
+   - 调整数据结构，使其更方便后续操作。
+   - 遍历每个多边形标注，根据标注的类型（忽略标签或文本区域尺寸）进行处理，更新对应的 mask。
+   - 对于不需要忽略的文本区域，进行多边形的收缩操作，并绘制出二值图（probability map）。
+   - 更新数据字典中的信息，包括图像、多边形、二值图和 mask，然后返回该数据字典。
+
+整体上，这段代码实现了根据文本区域标注构造出二值图和 mask 的功能，其中利用了多边形的收缩操作来生成二值图，同时根据文本区域的尺寸和忽略标签来更新 mask。
+
+```python
+class MakeSegDetectionData():
+    '''
+    构造文本区域二值图（DB论文中的 probability map），以及用于计算loss的mask
+    '''
+    def __init__(self, min_text_size=8, shrink_ratio=0.4):
+        self.min_text_size = min_text_size
+        self.shrink_ratio = shrink_ratio      # polygon 收缩比例
+
+
+    def process(self, data):
+        # 数据结构调整统一，方便后续操作
+        polygons = []
+        ignore_tags = []
+        annotations = data['polys']
+        for annotation in annotations:
+            polygons.append(np.array(annotation['points']))
+            ignore_tags.append(annotation['ignore'])
+        ignore_tags = np.array(ignore_tags, dtype=np.uint8)
+        filename = data.get('filename', data['data_id'])
+        shape = np.array(data['shape'])
+        data = OrderedDict(image=data['image'],
+                           polygons=polygons,
+                           ignore_tags=ignore_tags,
+                           shape=shape,
+                           filename=filename,
+                           is_training=data['is_training'])
+
+        image = data['image']
+        polygons = data['polygons']
+        ignore_tags = data['ignore_tags']
+        image = data['image']
+        filename = data['filename']
+
+
+        h, w = image.shape[:2]
+        if data['is_training']:
+            polygons, ignore_tags = self.validate_polygons(polygons, ignore_tags, h, w)
+        gt = np.zeros((h, w), dtype=np.float32)
+        mask = np.ones((h, w), dtype=np.float32)
+        for i in range(len(polygons)):
+            polygon = polygons[i]
+            height = max(polygon[:, 1]) - min(polygon[:, 1])
+            width = max(polygon[:, 0]) - min(polygon[:, 0])
+            if ignore_tags[i] or min(height, width) < self.min_text_size: # 文本区域太小时，作为困难样本 ignore
+                cv2.fillPoly(mask, polygon.astype(np.int32)[np.newaxis, :, :], 0)
+                ignore_tags[i] = True
+            else:
+                # 收缩 polygon 并绘制 probability map
+                polygon_shape = Polygon(polygon)
+                distance = polygon_shape.area * (1 - np.power(self.shrink_ratio, 2)) / polygon_shape.length
+                subject = [tuple(l) for l in polygons[i]]
+                padding = pyclipper.PyclipperOffset()
+                padding.AddPath(subject, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+                shrinked = padding.Execute(-distance)
+                if shrinked == []:
+                    cv2.fillPoly(mask, polygon.astype(np.int32)[np.newaxis, :, :], 0)
+                    ignore_tags[i] = True
+                    continue
+                shrinked = np.array(shrinked[0]).reshape(-1, 2)
+                cv2.fillPoly(gt, [shrinked.astype(np.int32)], 1)
+
+
+        if filename is None:
+            filename = ''
+        data.update(image=image,
+                    polygons=polygons,
+                    gt=gt, mask=mask, filename=filename)
+        return data
+```
+
+1. `__init__` 方法：
+   - 初始化函数，用于设置构造二值图的参数。
+   - 接受三个参数 `shrink_ratio`、`thresh_min` 和 `thresh_max`，分别表示收缩比例、二值图中边界的最小值和最大值。
+   - 忽略了警告以简化输出。
+
+2. `process` 方法：
+   - 接受一个数据字典作为输入，其中包含图像和多边形标注等信息。
+   - 遍历每个多边形标注，根据标注的类型进行处理，更新二值图和 mask。
+   - 将二值图缩放到指定的范围内，然后将二值图和 mask 存储在数据字典中，并返回该数据字典。
+
+3. `draw_border_map` 方法：
+   - 绘制文本边界的二值图。
+   - 首先根据收缩比例对多边形进行收缩操作，并绘制出收缩后的多边形，同时更新 mask。
+   - 计算多边形的边界，并根据边界计算出边界与像素点之间的距离，然后根据距离更新二值图。
+
+4. `distance` 方法：
+   - 计算图像中的点到多边形边界的距离。
+   - 接受坐标点和多边形的两个端点作为输入，计算点到边界的距离，并返回结果。
+
+整体上，这段代码实现了根据文本多边形标注构造出文本边界的二值图和 mask 的功能，其中利用了多边形的收缩操作来生成边界二值图，并根据多边形的边界距离计算出边界像素的值。
+
+```python
+class MakeBorderMap():
+    '''
+    构造文本边界二值图（DB论文中的 threshold map），以及用于计算loss的mask
+    '''
+    def __init__(self, shrink_ratio=0.4, thresh_min=0.3, thresh_max=0.7):
+        self.shrink_ratio = shrink_ratio
+        self.thresh_min = thresh_min
+        self.thresh_max = thresh_max
+        warnings.simplefilter("ignore")
+
+
+    def process(self, data):
+        image = data['image']
+        polygons = data['polygons']
+        ignore_tags = data['ignore_tags']
+        canvas = np.zeros(image.shape[:2], dtype=np.float32)
+        mask = np.zeros(image.shape[:2], dtype=np.float32)
+
+
+        for i in range(len(polygons)):
+            if ignore_tags[i]:
+                continue
+            self.draw_border_map(polygons[i], canvas, mask=mask)    # 绘制 border map
+        canvas = canvas * (self.thresh_max - self.thresh_min) + self.thresh_min
+        data['thresh_map'] = canvas
+        data['thresh_mask'] = mask
+        return data
+
+
+    def draw_border_map(self, polygon, canvas, mask):
+        polygon = np.array(polygon)
+        assert polygon.ndim == 2
+        assert polygon.shape[1] == 2
+
+
+        polygon_shape = Polygon(polygon)
+        distance = polygon_shape.area * (1 - np.power(self.shrink_ratio, 2)) / polygon_shape.length
+        subject = [tuple(l) for l in polygon]
+        padding = pyclipper.PyclipperOffset()
+        padding.AddPath(subject, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+        padded_polygon = np.array(padding.Execute(distance)[0])
+        cv2.fillPoly(mask, [padded_polygon.astype(np.int32)], 1.0)
+
+
+        xmin = padded_polygon[:, 0].min()
+        xmax = padded_polygon[:, 0].max()
+        ymin = padded_polygon[:, 1].min()
+        ymax = padded_polygon[:, 1].max()
+        width = xmax - xmin + 1
+        height = ymax - ymin + 1
+
+
+        polygon[:, 0] = polygon[:, 0] - xmin
+        polygon[:, 1] = polygon[:, 1] - ymin
+
+
+        xs = np.broadcast_to(np.linspace(0, width - 1, num=width).reshape(1, width), (height, width))
+        ys = np.broadcast_to(np.linspace(0, height - 1, num=height).reshape(height, 1), (height, width))
+
+
+        distance_map = np.zeros((polygon.shape[0], height, width), dtype=np.float32)
+        for i in range(polygon.shape[0]):
+            j = (i + 1) % polygon.shape[0]
+            absolute_distance = self.distance(xs, ys, polygon[i], polygon[j])
+            distance_map[i] = np.clip(absolute_distance / distance, 0, 1)
+        distance_map = distance_map.min(axis=0)
+
+
+        xmin_valid = min(max(0, xmin), canvas.shape[1] - 1)
+        xmax_valid = min(max(0, xmax), canvas.shape[1] - 1)
+        ymin_valid = min(max(0, ymin), canvas.shape[0] - 1)
+        ymax_valid = min(max(0, ymax), canvas.shape[0] - 1)
+        canvas[ymin_valid:ymax_valid + 1, xmin_valid:xmax_valid + 1] = np.fmax(
+            1 - distance_map[
+                ymin_valid-ymin:ymax_valid-ymax+height,
+                xmin_valid-xmin:xmax_valid-xmax+width],
+            canvas[ymin_valid:ymax_valid + 1, xmin_valid:xmax_valid + 1])
+
+
+    def distance(self, xs, ys, point_1, point_2):
+        # 计算图像中的点到 文字polygon 边界的距离
+        height, width = xs.shape[:2]
+        square_distance_1 = np.square(
+            xs - point_1[0]) + np.square(ys - point_1[1])
+        square_distance_2 = np.square(
+            xs - point_2[0]) + np.square(ys - point_2[1])
+        square_distance = np.square(
+            point_1[0] - point_2[0]) + np.square(point_1[1] - point_2[1])
+
+
+        cosin = (square_distance - square_distance_1 - square_distance_2) / (2 * np.sqrt(square_distance_1 * square_distance_2))
+        square_sin = 1 - np.square(cosin)
+        square_sin = np.nan_to_num(square_sin)
+        result = np.sqrt(square_distance_1 * square_distance_2 * square_sin / square_distance)
+
+
+        result[cosin < 0] = np.sqrt(np.fmin(square_distance_1, square_distance_2))[cosin < 0]
+        return result
+```
+
+### 将图像元素值归一化到[-1, 1]
+
+这段代码是一个名为 `NormalizeImage` 的类，用于将图像的元素值归一化到 `[-1, 1]` 的范围内。让我们逐步分析这段代码：
+
+1. 类属性 `RGB_MEAN`：
+   - 一个长度为 3 的 NumPy 数组，表示 RGB 图像的均值。用于归一化图像。
+
+2. `process` 方法：
+   - 接受一个数据字典作为输入，其中包含图像等信息。
+   - 从数据字典中提取图像，并进行归一化操作。首先减去 RGB 均值，然后除以 255。
+   - 将归一化后的图像转换为 PyTorch 张量，并按照通道顺序重新排列为 `(C, H, W)` 的形状。
+   - 更新数据字典中的图像，并返回该数据字典。
+
+3. `restore` 方法（类方法）：
+   - 接受一个 PyTorch 张量作为输入，表示需要恢复的图像。
+   - 将 PyTorch 张量转换为 NumPy 数组，并进行逆归一化操作。首先将通道重新排列为 `(H, W, C)` 的形状，然后乘以 255，并加上 RGB 均值。
+   - 将恢复后的图像转换为 `uint8` 类型，并返回该图像。
+
+整体上，这段代码实现了图像的归一化和逆归一化操作，其中利用了 RGB 均值来归一化图像，并在逆归一化过程中恢复图像的原始值。
+
+```python
+class NormalizeImage():
+    '''
+    将图像元素值归一化到[-1, 1]
+    '''
+    RGB_MEAN = np.array([122.67891434, 116.66876762, 104.00698793])
+
+
+    def process(self, data):
+        assert 'image' in data, '`image` in data is required by this process'
+        image = data['image']
+        image -= self.RGB_MEAN
+        image /= 255.
+        image = torch.from_numpy(image).permute(2, 0, 1).float()
+        data['image'] = image
+        return data
+
+    @classmethod
+    def restore(self, image):
+        image = image.permute(1, 2, 0).to('cpu').numpy()
+        image = image * 255.
+        image += self.RGB_MEAN
+        image = image.astype(np.uint8)
+        return image
+```
+
+###   过滤掉后续不需要的键值对
+
+这段代码是一个名为 `FilterKeys` 的类，用于过滤掉数据字典中不需要的键值对。让我们逐步分析这段代码：
+
+1. `__init__` 方法：
+   - 初始化函数，用于设置需要过滤掉的键的集合。
+   - 接受一个参数 `superfluous`，表示后续不需要的键值对的键集合。
+   - 将传入的键集合转换为集合类型并存储在 `self.superfluous_keys` 中。
+
+2. `process` 方法：
+   - 接受一个数据字典作为输入，其中包含待处理的键值对。
+   - 遍历 `self.superfluous_keys` 中的键，在数据字典中删除这些键值对。
+   - 返回处理后的数据字典。
+
+这段代码实现了一个简单的过滤器，用于从数据字典中删除指定的键值对，以便后续处理过程不需要处理这些键值对。
+
+```python
+class FilterKeys():
+    '''
+    过滤掉后续不需要的键值对
+    '''
+    def __init__(self, superfluous):
+        self.superfluous_keys = set(superfluous)
+
+    def process(self, data):
+        for key in self.superfluous_keys:
+            del data[key]
+        return data
+```
+
+### 训练集数据处理
+
+这段代码定义了一个名为 `train_processes` 的列表，其中包含了一系列数据处理步骤，用于训练过程中对数据进行预处理。让我们逐步分析这些处理步骤：
+
+1. `BaseAugment`:
+   - 使用基本的数据增强方法，包括水平翻转、旋转和尺寸调整。
+
+2. `ColorJitter`:
+   - 进行颜色增强，包括亮度、对比度、饱和度和色相变换。
+
+3. `RandomCropData`:
+   - 对图像进行随机裁剪，并保证裁剪时不切割到文本区域。
+
+4. `MakeSegDetectionData`:
+   - 构造文本区域二值图（probability map）以及用于计算损失的 mask。
+
+5. `MakeBorderMap`:
+   - 构造文本边界二值图（threshold map）以及用于计算损失的 mask。
+
+6. `NormalizeImage`:
+   - 将图像元素值归一化到 `[-1, 1]` 的范围内。
+
+7. `FilterKeys`:
+   - 过滤掉不需要的键值对，包括 `polygons`、`filename`、`shape`、`ignore_tags` 和 `is_training`。
+
+这些处理步骤将被按顺序应用于训练数据，以便在模型训练过程中对数据进行预处理和增强。
+
+```python
+train_processes = [
+    BaseAugment(only_resize=False, keep_ratio=False,
+        augmenters=iaa.Sequential([
+            iaa.Fliplr(0.5),               # 水平翻转
+            iaa.Affine(rotate=(-10, 10)),  # 旋转
+            iaa.Resize((0.5, 3.0))         # 尺寸调整
+        ])),
+    ColorJitter(),                         # 颜色增强
+    RandomCropData(size=[640, 640]),       # 随机裁剪
+    MakeSegDetectionData(),                # 构造 probability map
+    MakeBorderMap(),                       # 构造 threshold map
+    NormalizeImage(),                      # 归一化
+    FilterKeys(superfluous=['polygons', 'filename', 'shape', 'ignore_tags', 'is_training']),    # 过滤多余元素
+]
+```
+
+### 数据集导入方法
+
+这段代码定义了一个名为 `ImageDataset` 的数据集类，用于加载图像数据和相应的标注信息，并应用预处理步骤对数据进行处理。让我们逐步分析这段代码：
+
+1. `__init__` 方法：
+   - 初始化函数，用于设置数据集的路径、是否为训练模式以及数据处理步骤。
+   - 接受参数 `data_dir` 和 `gt_dir`，分别表示图像数据和标注信息的路径。
+   - `is_training` 表示是否为训练模式，`processes` 表示数据处理步骤列表。
+   - 初始化图像路径列表 `self.image_paths` 和标注路径列表 `self.gt_paths`，并加载标注信息。
+
+2. `load_ann` 方法：
+   - 加载标注信息的辅助函数，用于从文本文件中读取标注信息并存储为列表形式。
+
+3. `__getitem__` 方法：
+   - 根据给定的索引加载图像数据和对应的标注信息。
+   - 读取图像数据和标注信息，并将其存储在 `data` 字典中。
+   - 根据是否提供了数据处理步骤，逐步应用这些步骤对数据进行处理。
+   - 返回处理后的数据。
+
+4. `__len__` 方法：
+   - 返回数据集的长度，即图像路径列表的长度。
+
+这个数据集类可以方便地加载图像数据和标注信息，并根据提供的处理步骤对数据进行处理。
+
+```python
+class ImageDataset(data.Dataset):
+    def __init__(self, data_dir=None, gt_dir=None, is_training=True, processes=None):
+        self.data_dir = data_dir
+        self.gt_dir = gt_dir
+        self.is_training = is_training
+        self.processes = processes
+
+
+        self.image_paths = []
+        self.gt_paths = []
+
+
+        image_list = os.listdir(self.data_dir)
+        self.image_paths = [self.data_dir + '/' + t for t in image_list]
+        self.gt_paths = [self.gt_dir + '/' + t.replace('.jpg', '.txt') for t in image_list]
+        self.targets = self.load_ann()      # 导入标注信息
+
+
+    def load_ann(self):
+        res = []
+        for gt in self.gt_paths:
+            lines = []
+            reader = open(gt, 'r').readlines()
+            for line in reader:
+                item = {}
+                line = line.strip().split()
+                poly = np.array(list(map(float, line[:8]))).reshape((-1, 2)).tolist()
+                item['poly'] = poly
+                item['text'] = line[8]   # 前8为 polygon 坐标，第9是文本字符串
+                lines.append(item)
+            res.append(lines)
+        return res
+
+
+    def __getitem__(self, index):
+        if index >= len(self.image_paths):
+            index = index % len(self.image_paths)
+        data = {}
+        image_path = self.image_paths[index]
+
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR).astype('float32')
+        target = self.targets[index]
+
+        data['filename'] = image_path.split('/')[-1]
+        data['data_id'] = image_path.split('/')[-1]
+        data['image'] = img
+        data['lines'] = target
+        data['is_training'] = self.is_training
+        if self.processes is not None:
+            for data_process in self.processes:    # 做数据增强
+                data = data_process.process(data)
+        return data
+
+
+    def __len__(self):
+        return len(self.image_paths)
+```
+
+### 数据处理可视化
+
+这段代码是用于数据处理可视化的部分，包括加载数据集、获取一个 batch，并对 batch 中的图像和相关数据进行可视化展示。让我们逐步分析这段代码：
+
+创建 ImageDataset 实例 train_dataset：
+
+使用 ImageDataset 类加载训练数据集。
+设置数据目录、标注目录、训练模式和数据处理步骤。
+创建数据加载器 train_dataloader：
+
+使用 DataLoader 类创建数据加载器，用于加载 train_dataset 中的数据。
+设置批量大小为 2，使用 0 个工作线程，打乱数据并不丢弃最后一批数据。
+获取一个 batch 数据：
+
+使用 next(iter(train_dataloader)) 获取一个 batch 数据。
+画图：
+
+使用 Matplotlib 绘制图像和相关数据的可视化结果。
+展示图像、probability map、threshold map 和 threshold mask。
+这段代码通过可视化展示了经过处理后的图像以及相应的概率图、阈值图和阈值 mask，有助于了解数据处理的效果和结果。
+
+```python
+# 数据处理可视化
+train_dataset = ImageDataset(data_dir=det_args.train_dir, gt_dir=det_args.train_gt_dir, is_training=True, processes=train_processes)
+train_dataloader = data.DataLoader(train_dataset, batch_size=2, num_workers=0, shuffle=True, drop_last=False)
+batch = next(iter(train_dataloader))    # 获取一个 batch
+
+
+# 画图
+plt.figure(figsize=(60,60))
+image = NormalizeImage.restore(batch['image'][0])
+plt.subplot(141)
+plt.title('image', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(image)
+
+
+probability_map = (batch['gt'][0].to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(142)
+plt.title('probability_map', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(probability_map, cmap='gray')
+
+
+threshold_map = (batch['thresh_map'][0].to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(143)
+plt.title('threshold_map', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(threshold_map, cmap='gray')
+
+
+threshold_mask = (batch['thresh_mask'][0].to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(144)
+plt.title('threshold_mask', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(threshold_mask, cmap='gray')
+```
+
+<div style="text-align:center;">
+    <img src="https://github.com/LouisMao666/meter-identify/assets/149593046/73203406-e4e1-496e-8a76-254195a27473" alt="image">
+</div>
+
+### 
+
+
+
+
+
+
+
+
+
+
 
 
 
