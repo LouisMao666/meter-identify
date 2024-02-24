@@ -807,11 +807,608 @@ plt.yticks([])
 plt.imshow(threshold_mask, cmap='gray')
 ```
 
+显示效果如下：
+
 <div style="text-align:center;">
     <img src="https://github.com/LouisMao666/meter-identify/assets/149593046/73203406-e4e1-496e-8a76-254195a27473" alt="image">
 </div>
 
+### 计算 map 损失
+
+这段代码定义了几种损失函数，用于训练文本检测模型。让我简要解释一下这些损失函数的作用：
+
+1. **MaskL1Loss**: 这个损失函数用于计算 threshold map 的 L1 损失。在文本检测中，threshold map 通常表示文本的边界信息，这个损失函数的目的是使预测的 threshold map 与真实的 threshold map 之间的差异最小化。
+
+2. **DiceLoss**: 这个损失函数用于计算 approximate binary map 的 Dice 损失。在文本检测中，approximate binary map 通常用于表示文本的二值分割结果，这个损失函数的目的是使预测的 approximate binary map 与真实的 binary map 之间的重叠最大化。
+
+3. **L1BalanceCELoss**: 这个损失函数结合了 L1 损失、二分类交叉熵损失和 Dice 损失。通过权衡不同的损失函数，它可以更好地训练文本检测模型。其中，`l1_scale` 和 `bce_scale` 分别表示 L1 损失和二分类交叉熵损失的权重。
+
+这些损失函数在训练过程中被用于计算模型预测值与真实标签之间的差异，并且被用作优化目标，以便通过反向传播算法来调整模型的参数，从而使模型的预测更加接近真实情况。
+
+```python
+# MaskL1Loss 计算 threshold map 损失
+class MaskL1Loss(nn.Module):
+    def __init__(self):
+        super(MaskL1Loss, self).__init__()
+
+
+    def forward(self, pred, gt, mask):
+        mask_sum = mask.sum()
+        if mask_sum.item() == 0:
+            return mask_sum
+        else:
+            loss = (torch.abs(pred[:, 0] - gt) * mask).sum() / mask_sum
+            return loss
+
+
+# DiceLoss 计算 approximate binary map 损失
+class DiceLoss(nn.Module):
+    '''
+    Loss function from https://arxiv.org/abs/1707.03237
+    '''
+    def __init__(self, eps=1e-6):
+        super(DiceLoss, self).__init__()
+        self.eps = eps
+
+
+    def forward(self, pred, gt, mask):
+        if pred.dim() == 4:
+            pred = pred[:, 0, :, :]
+        assert pred.shape == gt.shape
+        assert pred.shape == mask.shape
+
+
+        interp = (pred * gt * mask).sum()
+        union = (pred * mask).sum() + (gt * mask).sum() + self.eps
+        loss = 1 - 2.0 * interp / union
+        return loss
+
+
+class L1BalanceCELoss(nn.Module):
+    def __init__(self, eps=1e-6, l1_scale=10, bce_scale=1):
+        super(L1BalanceCELoss, self).__init__()
+        self.dice_loss = DiceLoss(eps=eps)
+        self.l1_loss = MaskL1Loss()
+        self.bce_loss = BalanceCrossEntropyLoss()
+
+
+        self.l1_scale = l1_scale        # 不同损失赋予不同权重
+        self.bce_scale = bce_scale
+
+
+    def forward(self, pred, batch):
+        metrics = dict()
+        bce_loss = self.bce_loss(pred['binary'], batch['gt'], batch['mask'])
+        l1_loss = self.l1_loss(pred['thresh'], batch['thresh_map'], batch['thresh_mask'])
+        dice_loss = self.dice_loss(pred['thresh_binary'], batch['gt'], batch['mask'])
+
+        loss = dice_loss + self.l1_scale * l1_loss + bce_loss * self.bce_scale
+        metrics['binary_loss'] = bce_loss
+        metrics['thresh_loss'] = l1_loss
+        metrics['thresh_binary_loss'] = dice_loss
+
+        return loss, metrics
+```
+
+### 网络模型
+
+这段代码定义了一个用于文本检测的神经网络模型。让我简要解释一下其结构和功能：
+
+#### Backbone
+- `Bottleneck`: 这是 ResNet 的基本模块。它由一系列卷积层和批归一化层组成，用于提取输入图像的特征。
+- `ResNet`: 这是一个基于 ResNet 架构的主干网络。它包含多个不同层级的 Bottleneck 模块，用于逐步提取图像特征。ResNet 的最后输出是不同分辨率的特征图，供后续的分割网络使用。
+
+#### Decoder
+- `SegDetector`: 这是一个分割网络，用于从 ResNet 的特征图中生成文本检测的输出。它通过上采样和融合不同层级的特征图来生成最终的文本检测结果。
+
+#### 损失函数
+- `L1BalanceCELoss`: 这是一个综合了 L1 损失、二分类交叉熵损失和 Dice 损失的损失函数。它用于衡量模型预测值与真实标签之间的差异，帮助模型学习更好地进行文本检测。
+
+#### 模型封装
+- `BasicModel`: 这是将 Backbone 和 Decoder 组合在一起的基本模型。它负责将输入图像送入 Backbone 进行特征提取，然后将特征传递给 Decoder 进行文本检测。
+- `SegDetectorModel`: 这是对 BasicModel 进行包装的模型。它负责将输入数据送入模型，并根据是否处于训练阶段来计算损失函数或生成预测结果。
+
+通过这样的网络结构和损失函数，模型能够学习有效地进行文本检测任务。
+
+```python
+'''
+Backbone
+'''
+class Bottleneck(nn.Module):
+    expansion = 4
+
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+
+    def forward(self, x):
+        residual = x
+
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+
+        out += residual
+        out = self.relu(out)
+
+
+        return out
+
+
+class ResNet(nn.Module):
+    def __init__(self, block=Bottleneck, layers=[3, 4, 6, 3], num_classes=1000):
+        super(ResNet, self).__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AvgPool2d(7, stride=1)
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        self.smooth = nn.Conv2d(2048, 256, kernel_size=1, stride=1, padding=1)
+
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+
+        return nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+
+        x2 = self.layer1(x)
+        x3 = self.layer2(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+
+
+        return x2, x3, x4, x5
+
+'''
+Decoder
+'''
+class SegDetector(nn.Module):
+    def __init__(self, in_channels=[256, 512, 1024, 2048], inner_channels=256, k=50, bias=False):
+        super(SegDetector, self).__init__()
+        self.k = k
+        self.up5 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up4 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up3 = nn.Upsample(scale_factor=2, mode='nearest')
+
+
+        self.in5 = nn.Conv2d(in_channels[-1], inner_channels, 1, bias=bias)
+        self.in4 = nn.Conv2d(in_channels[-2], inner_channels, 1, bias=bias)
+        self.in3 = nn.Conv2d(in_channels[-3], inner_channels, 1, bias=bias)
+        self.in2 = nn.Conv2d(in_channels[-4], inner_channels, 1, bias=bias)
+
+
+        self.out5 = nn.Sequential(
+            nn.Conv2d(inner_channels, inner_channels // 4, 3, padding=1, bias=bias),
+            nn.Upsample(scale_factor=8, mode='nearest'))
+        self.out4 = nn.Sequential(
+            nn.Conv2d(inner_channels, inner_channels // 4, 3, padding=1, bias=bias),
+            nn.Upsample(scale_factor=4, mode='nearest'))
+        self.out3 = nn.Sequential(
+            nn.Conv2d(inner_channels, inner_channels // 4, 3, padding=1, bias=bias),
+            nn.Upsample(scale_factor=2, mode='nearest'))
+        self.out2 = nn.Conv2d(
+            inner_channels, inner_channels//4, 3, padding=1, bias=bias)
+
+
+        self.binarize = nn.Sequential(
+            nn.Conv2d(inner_channels, inner_channels // 4, 3, padding=1, bias=bias),
+            nn.BatchNorm2d(inner_channels//4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(inner_channels//4, inner_channels//4, 2, 2),
+            nn.BatchNorm2d(inner_channels//4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(inner_channels//4, 1, 2, 2),
+            nn.Sigmoid())
+        self.binarize.apply(self.weights_init)
+
+
+        self.thresh = nn.Sequential(
+            nn.Conv2d(inner_channels, inner_channels // 4, 3, padding=1, bias=bias),
+            nn.BatchNorm2d(inner_channels//4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(inner_channels // 4, inner_channels // 4, 2, 2),
+            nn.BatchNorm2d(inner_channels//4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(inner_channels // 4, 1, 2, 2),
+            nn.Sigmoid())
+        self.thresh.apply(self.weights_init)
+
+
+        self.in5.apply(self.weights_init)
+        self.in4.apply(self.weights_init)
+        self.in3.apply(self.weights_init)
+        self.in2.apply(self.weights_init)
+        self.out5.apply(self.weights_init)
+        self.out4.apply(self.weights_init)
+        self.out3.apply(self.weights_init)
+        self.out2.apply(self.weights_init)
+
+
+    def weights_init(self, m):
+        # 模型权重初始化
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1:
+            nn.init.kaiming_normal_(m.weight.data)
+        elif classname.find('BatchNorm') != -1:
+            m.weight.data.fill_(1.)
+            m.bias.data.fill_(1e-4)
+
+
+    def forward(self, features):
+        c2, c3, c4, c5 = features
+        in5 = self.in5(c5)
+        in4 = self.in4(c4)
+        in3 = self.in3(c3)
+        in2 = self.in2(c2)
+
+
+        out4 = self.up5(in5) + in4   # 尺寸为输入图像的 1/16
+        out3 = self.up4(out4) + in3  # 1/8
+        out2 = self.up3(out3) + in2  # 1/4
+
+
+        p5 = self.out5(in5)
+        p4 = self.out4(out4)
+        p3 = self.out3(out3)
+        p2 = self.out2(out2)
+
+
+        fuse = torch.cat((p5, p4, p3, p2), 1)    # 尺寸为 batch_size，64*4， H', W'
+        binary = self.binarize(fuse)
+        if self.training:
+            result = OrderedDict(binary=binary)
+            thresh = self.thresh(fuse)
+            thresh_binary = self.step_function(binary, thresh)
+            result.update(thresh=thresh, thresh_binary=thresh_binary)
+            return result
+        else:
+            return binary    # for inference
+
+
+    def step_function(self, x, y):
+        return torch.reciprocal(1 + torch.exp(-self.k * (x - y)))
+
+
+
+# 包装
+class BasicModel(nn.Module):
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.backbone = ResNet()
+        self.decoder = SegDetector()
+
+
+    def forward(self, data):
+        output = self.backbone(data)
+        output = self.decoder(output)
+        return output
+
+
+class SegDetectorModel(nn.Module):
+    def __init__(self, device):
+        super(SegDetectorModel, self).__init__()
+        self.model = BasicModel()
+        self.criterion = L1BalanceCELoss()
+        self.device = device
+        self.to(self.device)
+
+
+    def forward(self, batch, training=True):
+        for key, value in batch.items():
+            if value is not None and hasattr(value, 'to'):
+                batch[key] = value.to(self.device)
+
+        pred = self.model(batch['image'].float())
+
+
+        if self.training:
+            loss, metrics = self.criterion(pred, batch)    # 计算损失函数
+            return pred, loss, metrics
+        else:
+            return pred
+```
+
+### 可视化模型训练过程中的数据和结果
+
+这段代码用于可视化模型训练过程中的数据和结果，具体包括：
+
+1. 获取一个训练批次的数据，并将其送入模型进行前向传播，计算损失函数和评价指标。
+2. 打印出输入数据、模型 backbone 的输出、模型 decoder 的输出、以及损失函数的计算结果。
+3. 绘制输入图像、ground truth 的 probability map、threshold map 以及模型预测的 approximate map。
+
+这样的可视化过程有助于我们了解模型在训练过程中的表现情况，从而进行调试和优化。
+
+如果你有任何问题或需要进一步的解释，请随时告诉我。
+
+```python
+train_dataset = ImageDataset(data_dir=det_args.train_dir, gt_dir=det_args.train_gt_dir, is_training=True, processes=train_processes)
+train_dataloader = data.DataLoader(train_dataset, batch_size=2, num_workers=0, shuffle=True, drop_last=False)
+batch = next(iter(train_dataloader))
+
+
+# 模型各阶段数据格式
+for key, value in batch.items():
+    if value is not None and hasattr(value, 'to'):
+        batch[key] = value.to(device)
+
+model = SegDetectorModel(device)
+model.train()
+out1 = model.model.backbone(batch['image'].float())
+out2 = model.model.decoder(out1)
+loss, metrics = model.criterion(out2, batch)
+
+
+# batch 输入
+print('batch 输入：')
+for key, value in batch.items():
+    print(key, value.shape)
+print()
+
+
+# backbone 输出
+print('backbone 输出：')
+for o1 in out1:
+    print(o1.shape)
+print()
+
+
+# decoder 输出
+print('decoder 输出：')
+for key, value in out2.items():
+    print(key, value.shape)
+print()
+
+
+# criterion 输出
+print('criterion 输出：')
+print('loss: ', loss)
+print(metrics)
+print()
+
+
+# 画图
+plt.figure(figsize=(60,60))
+image = NormalizeImage.restore(batch['image'][0])
+plt.subplot(141)
+plt.title('image', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(image)
+
+
+probability_map = (batch['gt'][0].to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(142)
+plt.title('probability_map', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(probability_map, cmap='gray')
+
+
+threshold_map = (batch['thresh_map'][0].to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(143)
+plt.title('threshold_map', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(threshold_map, cmap='gray')
+
+
+# 模型预测的 approximate map
+binary = (out2['binary'][0][0].detach().to('cpu').numpy() * 255).astype(np.uint8)
+plt.subplot(144)
+plt.title('binary', fontdict={'size': 60})
+plt.xticks([])
+plt.yticks([])
+plt.imshow(binary, cmap='gray')
+```
+
+#### 输出：
+
+batch 输入：
+image torch.Size([2, 3, 640, 640])
+gt torch.Size([2, 640, 640])
+mask torch.Size([2, 640, 640])
+thresh_map torch.Size([2, 640, 640])
+thresh_mask torch.Size([2, 640, 640])
+
+backbone 输出：
+torch.Size([2, 256, 160, 160])
+torch.Size([2, 512, 80, 80])
+torch.Size([2, 1024, 40, 40])
+torch.Size([2, 2048, 20, 20])
+
+decoder 输出：
+binary torch.Size([2, 1, 640, 640])
+thresh torch.Size([2, 1, 640, 640])
+thresh_binary torch.Size([2, 1, 640, 640])
+
+criterion 输出：
+loss:  tensor(12.5495, device='cuda:0', grad_fn=<AddBackward0>)
+{'binary_loss': tensor(7.8474, device='cuda:0', grad_fn=<DivBackward0>), 'thresh_loss': tensor(0.3727, device='cuda:0', grad_fn=<DivBackward0>), 'thresh_binary_loss': tensor(0.9749, device='cuda:0', grad_fn=<RsubBackward1>)}
+
+![image](https://github.com/LouisMao666/meter-identify/assets/149593046/71b74762-024d-40b3-9ccd-024ca90cd6e7)
+
+### 学习率调整方法
+
+这段代码实现了一个学习率调整的方法 `DecayLearningRate`，并将其应用于检测模型的训练过程 `det_train()` 中。
+
+在 `det_train()` 函数中，首先创建了模型、数据加载器和优化器。然后，通过 `DecayLearningRate` 类来调整学习率，根据当前的训练轮次和步数来更新学习率。在每个训练步骤中，计算损失、执行反向传播和优化器步骤。如果满足打印间隔条件，将打印出当前的训练信息，包括训练步数、轮次、损失、指标和学习率。最后，在每个保存间隔时保存模型的检查点，并在训练结束时保存最终模型。
+
+这种学习率调整方法可以根据训练的进展情况自动地调整学习率，以提高模型的性能和收敛速度。
+
+```python
+# 学习率调整方法
+class DecayLearningRate():
+    def __init__(self, lr=0.004, epochs=200, factor=0.9):
+        self.lr = lr
+        self.epochs = epochs
+        self.factor = factor
+
+
+    def get_learning_rate(self, epoch):
+        # 学习率随着训练过程进行不断下降
+        rate = np.power(1.0 - epoch / float(self.epochs + 1), self.factor)
+        return rate * self.lr
+
+    def update_learning_rate(self, optimizer, epoch):
+        lr = self.get_learning_rate(epoch)
+        for group in optimizer.param_groups:
+            group['lr'] = lr
+        return lr
+
+
+
+
+# 检测模型训练
+def det_train():
+    # model
+    model = SegDetectorModel(device)
+
+
+    # data_loader
+    train_dataset = ImageDataset(data_dir=det_args.train_dir, gt_dir=det_args.train_gt_dir, is_training=True, processes=train_processes)
+    train_dataloader = data.DataLoader(train_dataset, batch_size=det_args.batch_size, num_workers=det_args.num_workers, shuffle=True, drop_last=False)
+
+    # initialize dataloader and scheduler
+    optimizer = torch.optim.SGD(model.parameters(), lr=det_args.lr, momentum=0.9, weight_decay=1e-4)
+    scheduler = DecayLearningRate(lr=det_args.lr, epochs=det_args.max_epoch)
+
+
+    step = 0
+    epoch = 0
+    model.train()
+    os.makedirs(det_args.save_dir, exist_ok=True)
+    for epoch in range(det_args.max_epoch):
+        for batch in train_dataloader:
+            step += 1
+            current_lr = scheduler.update_learning_rate(optimizer, epoch)    # 学习率调整
+
+
+            optimizer.zero_grad()
+            pred, loss, metrics = model.forward(batch, training=True)
+            loss.backward()
+            optimizer.step()
+
+
+            if step % det_args.print_interval == 0:
+                line = []
+                for key, l_val in metrics.items():
+                    line.append('{0}: {1:.4f}'.format(key, l_val.mean()))
+                line = '\t'.join(line)
+                info = '\t'.join(['step:{:6d}', 'epoch:{:3d}', 'loss: {:4f}', '{}', 'lr: {:.4f}']).format(step, epoch, loss.item(), line, current_lr)
+                print(info)
+                #if DEBUG:   # DEBUG 这里只跑少量数据
+                    #break
+
+        # 保存阶段模型
+        if epoch % det_args.save_interval == 0:
+            save_name = 'checkpoint_' + str(epoch)
+            torch.save(model.state_dict(), os.path.join(det_args.save_dir, save_name))
+            torch.save(model.state_dict(), det_args.saved_model_path)
+        #if DEBUG:
+            #break
+
+
+    # 保存最终模型
+    torch.save(model.state_dict(), det_args.saved_model_path)
+```
+
+### 由于电脑性能，只训练了10个epoch，训练过程的输出如下：
+
+```css
+<div style="background-color:black; color:white">
+batch 输入：<br>
+image torch.Size([2, 3, 640, 640])<br>
+gt torch.Size([2, 640, 640])<br>
+mask torch.Size([2, 640, 640])<br>
+thresh_map torch.Size([2, 640, 640])<br>
+thresh_mask torch.Size([2, 640, 640])<br>
+
+backbone 输出：<br>
+torch.Size([2, 256, 160, 160])<br>
+torch.Size([2, 512, 80, 80])<br>
+torch.Size([2, 1024, 40, 40])<br>
+torch.Size([2, 2048, 20, 20])<br>
+
+decoder 输出：<br>
+binary torch.Size([2, 1, 640, 640])<br>
+thresh torch.Size([2, 1, 640, 640])<br>
+thresh_binary torch.Size([2, 1, 640, 640])<br>
+
+criterion 输出：<br>
+loss: tensor(12.5495, device='cuda:0', grad_fn=<AddBackward0>)<br>
+{'binary_loss': tensor(7.8474, device='cuda:0', grad_fn=<DivBackward0>), 'thresh_loss': tensor(0.3727, device='cuda:0', grad_fn=<DivBackward0>), 'thresh_binary_loss': tensor(0.9749, device='cuda:0', grad_fn=<RsubBackward1>)}
+</div>
+```
+
 ### 
+
+
+
+
+
+
+
 
 
 
