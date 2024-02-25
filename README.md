@@ -1,10 +1,15 @@
-manual meter reading is still necessary. In order to achieve automatic recognition of old mechanical water meters, a DL (deep learning) algorithm has been proposed.
+## 写在前面
+introduction：manual meter reading is still necessary. In order to achieve automatic recognition of old mechanical water meters, a DL (deep learning) algorithm has been proposed.
 
 本方案将任务拆解为两个子任务：
 
 1、水表读数区域准确估计；
 
 2、对估计出的读数区域中数字准确识别。
+
+**宏观流程图如下**
+
+![2024-02-25 (2)](https://github.com/LouisMao666/meter-identify/assets/149593046/97082ca3-d5c6-489e-8641-428687ebea50)
 
 ## 第一部分：水表读数区域准确估计
 
@@ -2531,9 +2536,50 @@ for i, line in enumerate(lines):
 
 ![image](https://github.com/LouisMao666/meter-identify/assets/149593046/a2f683e7-39dc-46f2-9469-d1585422e5e9)
 
-至此，全部代码就解释完啦，希望大家能有所收获
+至此，全部代码就解释完啦，希望大家能有所收获！！！！！
 
 ## 写在最后
+
+### 检查cuda是否可用
+
+因为cuda版本问题，最开始一直使用CPU训练模型，浪费了很多时间
+
+下面这段简单的代码,可以帮助你检查CUDA是否正常
+
+```python
+import torch
+
+# 检查是否有可用的 CUDA 设备
+if torch.cuda.is_available():
+    # 输出 CUDA 设备数量
+    print(torch.cuda.device_count())
+    # 输出当前 CUDA 设备索引
+    print(torch.cuda.current_device())
+    # 输出 CUDA 设备名称
+    print(torch.cuda.get_device_name(torch.cuda.current_device()))
+else:
+    print("CUDA is not available.")
+```
+
+### 我的感悟
+
+作为一位初学者，对CV的了解很少，初次看到这个项目也是一头雾水，很想放弃。
+
+最让人崩溃的是配置环境的过程，一开始并没有修改环境，导致后面的代码出现各种匪夷所思的错误。
+
+但迫于完成任务，还是顽强的将整个项目啃了下来。
+
+和以前看论文不同，上手实操比理解理论更有挑战性，总会遇到匪夷所思的问题，在此要感谢我的两位导师给予的帮助和点拨。
+
+总结了两点经验，希望能帮助其他新手克服独自面对大项目的恐惧：
+
+1. **借助外力** 无论是借助大模型还是看前人的做法，实操性的东西直接解决问题比思考的过程更加重要，所以遇到困难不如直接去网上找答案，花很多时间自己思考价值不大。
+
+2. **大事化小** 这个词不是很恰当，但总体思想就是将一个大任务化为小任务，再将小任务化为更小的任务。首先这样利于我们分部完成，其次每段时间完成了一个小项目，也会有一定
+
+的成就感，在更有动力开展后续的项目。
+
+
 
 
 
