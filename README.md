@@ -1943,6 +1943,605 @@ print('label_str: ', label_str)
 
 ![2024-02-25](https://github.com/LouisMao666/meter-identify/assets/149593046/4846dca6-d8aa-4ab9-98c3-c76c3e5b178d)
 
+### 网络模型
+
+1. **Backbone**：
+   - `_Block` 类定义了一个基本的残差块，用于构建ResNet的基本组件。
+   - `RecBackbone` 类定义了文本识别模型的主干网络，它由多个残差块组成的深度卷积神经网络堆叠而成。
+
+2. **Decoder模块**：
+   - `BidirectionalLSTM` 类定义了一个双向LSTM模块，用于解码卷积特征序列。
+   - `RecModelBuilder` 类将卷积特征序列送入双向LSTM进行解码，最终得到文本识别的预测结果。
+
+3. **前向传播方法**：
+   - `forward` 方法接受一个包含图像张量、文本标签张量和标签长度张量的输入。首先，将图像张量送入主干网络提取特征序列；然后，将特征序列送入双向LSTM进行解码，得到文本识别的预测结果。在训练模式下，计算CTC损失并返回；在推理模式下，返回预测结果的概率分布。
+
+该模型的主干网络采用了ResNet的设计，具有较强的特征提取能力；解码器采用了双向LSTM，能够更好地对序列数据进行建模，从而提高文本识别的准确性。
+
+```python
+# backbone
+class _Block(nn.Module):
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(_Block, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+
+
+class RecBackbone(nn.Module):
+    def __init__(self):
+        super(RecBackbone, self).__init__()
+
+        in_channels = 3
+        self.layer0 = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=(3, 3), stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True))
+
+
+        self.inplanes = 32
+        self.layer1 = self._make_layer(32,  3, [2, 2]) # [16, 50]
+        self.layer2 = self._make_layer(64,  4, [2, 2]) # [8, 25]
+        self.layer3 = self._make_layer(128, 6, [2, 1]) # [4, 25]
+        self.layer4 = self._make_layer(256, 6, [2, 1]) # [2, 25]
+        self.layer5 = self._make_layer(512, 3, [2, 1]) # [1, 25]
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, planes, blocks, stride):
+        downsample = None
+        if stride != [1, 1] or self.inplanes != planes:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes))
+
+        layers = []
+        layers.append(_Block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes
+        for _ in range(1, blocks):
+            layers.append(_Block(self.inplanes, planes))
+            return nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        x0 = self.layer0(x)
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+        x5 = self.layer5(x4)
+
+        cnn_feat = x5.squeeze(2) # [N, c, w]
+        cnn_feat = cnn_feat.transpose(2, 1)
+
+        return cnn_feat
+
+
+# decoder
+class BidirectionalLSTM(nn.Module):
+    def __init__(self, nIn=512, nHidden=512, nOut=512):
+        super(BidirectionalLSTM, self).__init__()
+        self.rnn = nn.LSTM(nIn, nHidden, bidirectional=True)
+        self.embedding = nn.Linear(nHidden * 2, nOut)
+
+    def forward(self, input):
+        recurrent, _ = self.rnn(input)
+        T, b, h = recurrent.size()
+        t_rec = recurrent.view(T * b, h)
+        output = self.embedding(t_rec)    # [T * b, nOut]
+        output = output.view(T, b, -1)
+
+        return output
+
+
+# basic
+class RecModelBuilder(nn.Module):
+    def __init__(self, rec_num_classes, sDim=512):
+        super(RecModelBuilder, self).__init__()
+        self.rec_num_classes = rec_num_classes
+        self.sDim = sDim
+
+        self.encoder = RecBackbone()
+        self.decoder = nn.Sequential(
+        BidirectionalLSTM(sDim, sDim, sDim),
+        BidirectionalLSTM(sDim, sDim, rec_num_classes))
+
+        self.rec_crit = nn.CTCLoss(zero_infinity=True)
+
+
+    def forward(self, inputs):
+        x, rec_targets, rec_lengths = inputs
+        batch_size = x.shape[0]
+
+        encoder_feats = self.encoder(x)   # N, T, C
+        encoder_feats = encoder_feats.transpose(0, 1).contiguous() # T, N, C
+        rec_pred = self.decoder(encoder_feats)
+
+        if self.training:
+            rec_pred = rec_pred.log_softmax(dim=2)
+            preds_size = torch.IntTensor([rec_pred.size(0)] * batch_size)
+            loss_rec = self.rec_crit(rec_pred, rec_targets, preds_size, rec_lengths)
+            return loss_rec
+        else:
+            rec_pred_scores = torch.softmax(rec_pred.transpose(0, 1), dim=2)
+            return rec_pred_scores
+```
+
+### 模型各阶段数据结构展示
+
+这段代码展示了模型在训练过程中各个阶段的数据结构，包括输入数据、主干网络（Encoder）的输出和解码器（Decoder）的输出。
+
+1. **输入数据**：
+   - `batch[0]`：图像数据，形状为 `[batch_size, channels, height, width]`。
+   - `batch[1]`：文本标签数据，形状为 `[batch_size, max_len]`，其中 `max_len` 是文本的最大长度。
+   - `batch[2]`：文本标签长度数据，形状为 `[batch_size]`，表示每个样本的文本标签的实际长度。
+
+2. **Encoder 输出**：
+   - `encoder_out`：主干网络（Encoder）的输出，形状为 `[seq_len, batch_size, num_features]`，其中 `seq_len` 是序列长度，`num_features` 是特征维度。
+
+3. **Decoder 输出**：
+   - `decoder_out`：解码器（Decoder）的输出，形状为 `[seq_len, batch_size, rec_num_classes]`，其中 `seq_len` 是序列长度，`rec_num_classes` 是文本识别的类别数量。
+
+这些输出数据的展示有助于理解模型在训练过程中数据流动的情况，以及各个阶段数据的形状和含义。
+
+```python
+'''
+模型各阶段数据结构展示
+'''
+dataset = WMRDataset(rec_args.train_dir, max_len=rec_args.max_len, resize_shape=(rec_args.height, rec_args.width), train=True)
+train_dataloader = data.DataLoader(dataset, batch_size=2, num_workers=0, shuffle=True, pin_memory=True, drop_last=False)
+batch = next(iter(train_dataloader))
+
+
+model = RecModelBuilder(rec_num_classes=rec_args.voc_size, sDim=rec_args.decoder_sdim)
+model = model.to(device)
+model.train()
+
+
+image, rec_targets, rec_lengths = [v.to(device) for v in batch]
+encoder_out = model.encoder(image)
+decoder_out = model.decoder(encoder_out.transpose(0, 1).contiguous())
+
+
+
+# batch 输入
+print('batch 输入 [image, label, label_length]：')
+print(batch[0].shape)
+print(batch[1].shape)
+print(batch[2].shape)
+print()
+
+
+# encoder 输出
+print('encoder 输出：')
+print(encoder_out.shape)
+print()
+
+
+# decoder 输出
+print('decoder 输出：')
+print(decoder_out.shape)
+```
+
+#### 输出
+
+**batch 输入 [image, label, label_length]：**
+- 图像数据：`torch.Size([2, 3, 32, 100])`
+- 文本标签数据：`torch.Size([2, 5])`
+- 文本标签长度数据：`torch.Size([2])`
+
+**encoder 输出：**
+- 主干网络输出：`torch.Size([2, 25, 512])`
+
+**decoder 输出：**
+- 解码器输出：`torch.Size([25, 2, 21])`
+
+这些输出数据的形状和含义如上所述，提供了有关模型在训练过程中各个阶段数据流动的重要信息。
+
+### 训练
+
+这段代码是用于训练文本识别模型的训练过程。以下是代码的主要步骤和功能：
+
+1. **数据准备**：
+   - 创建了用于训练的数据集对象 `dataset`，并通过 `DataLoader` 将数据按批次加载到模型中进行训练。
+
+2. **模型准备**：
+   - 创建了文本识别模型 `model`，其结构由 `RecModelBuilder` 类定义，并将模型移动到设备 `device` 上。
+   - 使用 `model.train()` 声明进入训练模式，该方法会启用 Batch Normalization 和 Dropout 等模型的训练模式。
+
+3. **优化器设置**：
+   - 创建了优化器 `optimizer`，这里使用了 Adadelta 优化器，用于更新模型参数以最小化损失。
+   - 使用 `torch.optim.lr_scheduler.MultiStepLR` 创建学习率调整策略 `scheduler`，在训练过程中根据指定的里程碑（`milestones`）调整学习率。
+
+4. **训练过程**：
+   - 使用嵌套的循环迭代训练数据集中的每个批次数据。
+   - 每个批次数据经过模型前向传播，计算损失，并通过反向传播更新模型参数。
+   - 训练过程中每隔一定步数会打印当前步数、当前轮次和损失值。
+   - 每个轮次结束后，根据指定的学习率调整策略更新学习率。
+   - 每隔一定轮次会保存模型的参数到指定路径。
+
+5. **模型保存**：
+   - 最后将训练好的模型参数保存到指定的路径 `rec_args.saved_model_path` 中。
+
+该代码通过迭代训练数据集中的多个轮次，逐步优化模型参数，以达到提高文本识别准确率的目的。
+
+```pyhton
+# train
+def rec_train():
+    # dataset
+    dataset = WMRDataset(rec_args.train_dir, max_len=rec_args.max_len, resize_shape=(rec_args.height, rec_args.width), train=True)
+    train_dataloader = data.DataLoader(dataset, batch_size=rec_args.batch_size, num_workers=rec_args.num_workers, shuffle=True, pin_memory=True, drop_last=False)
+
+    # model
+    model = RecModelBuilder(rec_num_classes=rec_args.voc_size, sDim=rec_args.decoder_sdim)
+    model = model.to(device)
+    model.train()
+
+    # Optimizer
+    param_groups = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = torch.optim.Adadelta(param_groups, lr=rec_args.lr)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=rec_args.milestones, gamma=0.1)
+
+
+    os.makedirs(rec_args.save_dir, exist_ok=True)
+    # do train
+    step = 0
+    for epoch in range(rec_args.max_epoch):
+        current_lr = optimizer.param_groups[0]['lr']
+
+        for i, batch in enumerate(train_dataloader):
+            step += 1
+            batch = [v.to(device) for v in batch]
+            loss = model(batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+
+            # print
+            if step % rec_args.print_interval == 0:
+                print('step: {:4d}\tepoch: {:4d}\tloss: {:.4f}'.format(step, epoch, loss.item()))
+        scheduler.step()
+
+        # save
+        if epoch % rec_args.save_interval == 0:
+            save_name = 'checkpoint_' + str(epoch)
+            torch.save(model.state_dict(), os.path.join(rec_args.save_dir, save_name))
+
+
+    torch.save(model.state_dict(), rec_args.saved_model_path)
+```
+
+#### 输出：
+
+![2024-02-25 (1)](https://github.com/LouisMao666/meter-identify/assets/149593046/72b66aa9-a732-4a44-aa4c-194aca91abf8)
+
+### 根据检测结果生成识别模型测试数据
+
+这段代码的功能是根据检测模型的输出结果生成用于识别模型测试的数据集。具体步骤如下：
+
+1. **准备路径**：
+   - 指定了检测结果所在的目录 `det_dir`，测试图像所在的目录 `test_dir`，以及用于保存生成的识别测试数据的目录 `word_save_dir`。
+
+2. **遍历检测结果文件**：
+   - 遍历检测结果目录中的文件列表，针对每个检测结果文件进行处理。
+
+3. **解析检测结果**：
+   - 读取每个检测结果文件的内容，解析出文本区域的位置信息。
+
+4. **图像矫正**：
+   - 根据文本区域的位置信息对原始图像进行透视变换，使得文本区域变为水平矩形，方便后续识别模型的处理。
+
+5. **保存图像**：
+   - 将经过透视变换后的文本图像保存到指定的识别测试数据目录中，以供后续测试使用。
+
+通过这个过程，可以将检测模型的输出结果转换为适合识别模型输入的测试数据，用于评估识别模型的性能。
+
+```python
+'''
+根据检测结果生成识别模型测试数据
+'''
+def rec_test_data_gen():
+    test_dir = 'data/test_imgs'
+    det_dir = 'temp/det_res'
+    word_save_dir = 'temp/rec_datasets/test_imgs'
+
+
+    os.makedirs(word_save_dir, exist_ok=True)
+    label_files = os.listdir(det_dir)
+    for label_file in tqdm(label_files):
+        if not label_file.endswith('.txt'):
+            continue
+        with open(os.path.join(det_dir, label_file), 'r') as f:
+            lines = f.readlines()
+        if len(lines) == 0:
+            continue
+        line = lines[0].strip().split(',')
+        locs = [float(t) for t in line[:8]]
+
+
+        # image warp
+        x1, y1, x2, y2, x3, y3, x4, y4 = locs
+        w = int(0.5 * (((x2-x1)**2+(y2-y1)**2)**0.5 + ((x4-x3)**2+(y4-y3)**2)**0.5))
+        h = int(0.5 * (((x2-x3)**2+(y2-y3)**2)**0.5 + ((x4-x1)**2+(y4-y1)**2)**0.5))
+        src_points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], dtype='float32')
+        dst_points = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype='float32')
+        M = cv2.getPerspectiveTransform(src_points, dst_points)
+        image = cv2.imread(os.path.join(test_dir, label_file.replace('det_res_', '')[:-4] + '.jpg'))
+        word_image = cv2.warpPerspective(image, M, (w, h))
+
+        # save images
+        cv2.imwrite(os.path.join(word_save_dir, label_file.replace('det_res_', '')[:-4]+'.jpg'), word_image)
+
+
+# 使用检测模型获取识别测试数据
+rec_test_data_gen()
+```
+
+### 模型处理
+
+这段代码是一个用于识别的推理过程。具体功能如下：
+
+1. **`rec_decode` 函数**：
+   - 该函数用于对模型输出的概率进行CTC解码，并将解码结果转换为文本字符串。它会去除空白字符并将连续相同字符合并。
+
+2. **`rec_load_test_image` 函数**：
+   - 该函数用于加载测试图像并进行预处理，使其符合模型输入的要求。这包括图像的缩放和标准化处理。
+
+3. **`rec_test` 函数**：
+   - 在测试过程中，首先加载训练好的识别模型。
+   - 遍历测试图像目录中的每张图像，加载图像并进行推理。
+   - 对推理结果进行解码得到识别文本。
+   - 将识别文本写入到相应的文本文件中，以供后续分析和评估。
+
+通过这个过程，可以利用训练好的识别模型对测试图像进行识别，并将识别结果保存下来。
+
+```python
+# inference
+# 模型输出进行CTC对应解码，去除blank，将连续同字符合并
+def rec_decode(rec_prob, labelmap, blank=0):
+    raw_str = torch.max(rec_prob, dim=-1)[1].data.cpu().numpy()
+    res_str = []
+    for b in range(len(raw_str)):
+        res_b = []
+        prev = -1
+        for ch in raw_str[b]:
+            if ch == prev or ch == blank:
+                prev = ch
+                continue
+            res_b.append(labelmap[ch])
+            prev = ch
+        res_str.append(''.join(res_b))
+    return res_str
+
+
+def rec_load_test_image(image_path, size=(100, 32)):
+    img = Image.open(image_path)
+    img = img.resize(size, Image.BILINEAR)
+    img = torchvision.transforms.ToTensor()(img)
+    img.sub_(0.5).div_(0.5)
+    return img.unsqueeze(0)
+
+
+# 测试
+def rec_test():
+    model = RecModelBuilder(rec_num_classes=rec_args.voc_size, sDim=rec_args.decoder_sdim)
+    model.load_state_dict(torch.load(rec_args.saved_model_path, map_location=device))
+    model.eval()
+
+    os.makedirs(rec_args.rec_res_dir, exist_ok=True)
+    _, _, labelmap = WMRDataset().gen_labelmap()          # labelmap是类别和字符对应的字典
+    with torch.no_grad():
+        for file in tqdm(os.listdir(rec_args.test_dir)):
+            img_path = os.path.join(rec_args.test_dir, file)
+            image = rec_load_test_image(img_path)
+            batch = [image, None, None]
+            pred_prob = model.forward(batch)
+            # todo post precess
+            rec_str = rec_decode(pred_prob, labelmap)[0]
+            # write to file
+            with open(os.path.join(rec_args.rec_res_dir, file.replace('.jpg', '.txt')), 'w') as f:
+                f.write(rec_str)
+```
+
+### 识别结果后处理
+
+这段代码实现了识别结果的后处理过程，包括以下步骤：
+
+1. **定义特殊字符映射**：
+   - 将识别结果中的特殊字符（'ABCDEFGHIJ'）映射为对应的数字字符（'1234567890'）。
+
+2. **遍历识别结果文件**：
+   - 遍历测试图像目录中的每张图像，读取相应的识别结果文件。
+
+3. **对识别结果进行特殊字符处理**：
+   - 将识别结果中的特殊字符替换为对应的数字字符。
+
+4. **对结果进行排序**：
+   - 按照文件名中的数字进行排序，以确保结果的顺序正确。
+
+5. **将结果写入CSV文件**：
+   - 将处理后的结果写入CSV文件中，每一行包含图像文件名和对应的识别结果。
+
+通过这个后处理过程，可以将识别结果中的特殊字符替换为数字字符，并将结果保存为CSV文件，方便后续的结果分析和评估。
+
+```python
+'''
+识别结果后处理
+'''
+import pandas as pd
+import re
+import csv
+def final_postProcess():
+    SPECIAL_CHARS = {k:v for k, v in zip('ABCDEFGHIJ', '1234567890')}
+
+
+    test_dir = 'data/test_imgs'
+    rec_res_dir = 'temp/rec_res'
+    rec_res_files = os.listdir(rec_res_dir)
+
+
+    final_res = dict()
+    for file in os.listdir(test_dir):
+        res_file = file.replace('.jpg', '.txt')
+        if res_file not in rec_res_files:
+            final_res[file] = ''
+            continue
+
+        with open(os.path.join(rec_res_dir, res_file), 'r') as f:
+            rec_res = f.readline().strip()
+        final_res[file] = ''.join([t if t not in 'ABCDEFGHIJ' else SPECIAL_CHARS[t] for t in rec_res])
+
+    sort_x = [(k, final_res[k]) for k in sorted(final_res.keys(), key=lambda l: int(re.findall('\d+', l)[0]))]
+    '''
+    with open('work/final_res.csv', 'w') as f:
+        for key, value in sort_x:
+            f.write(key + '\t' + value + '\n')
+    #txt = np.loadtxt('work/final_res.txt')
+    #txtDF = pd.DataFrame(txt)
+    #txtDF.to_csv('submission.csv',index=False)
+    df = pd.read_csv('work/final_res.csv',header=None)
+    df.columns = ["filename","result"] #添加自定义的columns的名字
+    '''
+    #for key, value in sort_x:
+        #value=value.zfill(5)
+    #result_list = [['1', 1, 1], ['2', 2, 2], ['3', 3, 3]]
+    #columns = ["filename", "result"]
+    '''
+    dt = pd.DataFrame(sort_x, columns=columns)
+    dt.to_csv("result_csv2.csv", index=0)
+    '''
+    f = open('result_csv.csv', 'w',encoding='utf-8-sig', newline="")
+    csv_write = csv.writer(f)
+    csv_write.writerow(['filename', 'result'])
+    for key, value in sort_x:
+        value=value.zfill(5)
+        #value="="+value
+        print(value)
+        csv_write.writerow([key,value])
+    f.close()
+# 生成最终的测试结果
+final_postProcess()
+```
+
+#### 输出：
+00372
+01725
+00879
+00053
+00325
+002726
+00028
+00034
+00026
+004941
+00045
+00048
+010564
+001323
+00501
+00062
+00323
+00095
+00023
+00337
+00000
+00002
+00396
+00430
+00238
+...
+00043
+00030
+00000
+00023
+
+### 最终结果可视化
+
+这段代码实现了最终结果的可视化过程，包括以下步骤：
+
+1. **读取最终结果文件**：
+   - 从指定路径读取包含图像文件名和识别结果的文本文件。
+
+2. **绘制图像和结果**：
+   - 针对前五个图像，读取其对应的图像文件并绘制在子图中。
+   - 将图像文件名和识别结果作为子图标题显示，字体大小设置为50。
+
+通过这个可视化过程，可以直观地查看每张图像的识别结果，并对结果进行直观的检查和评估。
+
+```python
+'''
+最终结果可视化
+'''
+%matplotlib inline
+import matplotlib
+import matplotlib.pyplot as plt
+
+
+with open('work/final_res.txt', 'r') as f:
+    lines = f.readlines()
+
+plt.figure(figsize=(60,60))
+lines = lines[:5]
+for i, line in enumerate(lines):
+    if len(line.strip().split()) == 1:
+        image_name = line.strip()        # 没有识别出来
+        word = '###'
+    else:
+        image_name, word = line.strip().split()
+    image = cv2.imread(os.path.join(test_dir, image_name))
+
+    plt.subplot(151+i)
+    plt.title(word, fontdict={'size': 50})
+    plt.xticks([])
+    plt.yticks([])
+    plt.imshow(image)
+```
+
+#### 输出显示
+
+同样还是训练批次少的缘故，准确率一般
+
+![image](https://github.com/LouisMao666/meter-identify/assets/149593046/a2f683e7-39dc-46f2-9469-d1585422e5e9)
+
+至此，全部代码就解释完啦，希望大家能有所收获
+
+## 写在最后
+
+
+
+
+
+
+
+
 
 
 
