@@ -1401,7 +1401,551 @@ loss: tensor(12.5495, device='cuda:0', grad_fn=<AddBackward0>)<br>
 </div>
 ```
 
-### 
+### 文本检测的后处理方法
+
+这段代码是一个用于文本检测的后处理方法，从预测的分割图中提取文本框的过程。以下是对该代码的主要步骤的解释：
+
+1. **`represent` 方法**：接受一个批次的图像和对应的预测结果，并对每张图像的预测结果进行处理，得到文本框的坐标和相应的得分。
+
+2. **`polygons_from_bitmap` 方法**：该方法从预测的分割图中提取文本框的多边形轮廓。它首先找到二值化后的分割图中的轮廓，然后对每个轮廓进行处理。对于每个轮廓，它进行多边形拟合以得到更加紧凑的表示，并计算一个得分以过滤掉低质量的候选框。在确定最终的多边形时，它对拟合得到的多边形进行了一定程度的扩张，并计算了最小外接矩形。
+
+3. **`unclip` 方法**：该方法对文本框的多边形进行一定程度的扩张，以覆盖更多的文本区域。
+
+4. **`get_mini_boxes` 方法**：该方法用于计算文本框的最小外接矩形。
+
+5. **`box_score_fast` 方法**：该方法用于计算文本框区域的得分，以确定其是否包含文本。它计算了文本框内像素点的平均得分作为最终得分。
+
+总体而言，这段代码利用了分割图和预测概率图来提取文本框。它采用多边形拟合和一些后处理步骤来获取更加准确的文本框表示。
+
+```python
+# 从分割图得到最终文字坐标的后处理方法
+class SegDetectorRepresenter():
+    '''
+    从 probability map 得到检测框的方法
+    '''
+    def __init__(self, thresh=0.3, box_thresh=0.7, max_candidates=100):
+        self.thresh = thresh
+        self.box_thresh = box_thresh
+        self.max_candidates = max_candidates
+        self.min_size = 3
+        self.scale_ratio = 0.4
+
+
+    def represent(self, batch, pred):
+        images = batch['image']
+        segmentation = pred > self.thresh    # 将预测分割图进行二值化
+        boxes_batch = []
+        scores_batch = []
+        for batch_index in range(images.size(0)):
+            height, width = batch['shape'][batch_index]
+            boxes, scores = self.polygons_from_bitmap(pred[batch_index], segmentation[batch_index], width, height)
+            boxes_batch.append(boxes)
+            scores_batch.append(scores)
+        return boxes_batch, scores_batch
+
+
+
+    def polygons_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
+        assert _bitmap.size(0) == 1
+        bitmap = _bitmap.cpu().numpy()[0]
+        pred = pred.cpu().detach().numpy()[0]
+        height, width = bitmap.shape
+        boxes = []
+        scores = []
+
+
+        contours, _ = cv2.findContours((bitmap*255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE) # 找分割轮廓
+
+
+        for contour in contours[:self.max_candidates]:
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)      # 多边形拟合轮廓曲线
+            points = approx.reshape((-1, 2))
+            if points.shape[0] < 4:
+                continue
+            score = self.box_score_fast(pred, points.reshape(-1, 2))   # 计算分割区域的整体得分，去除低分候选区域
+            if self.box_thresh > score:
+                continue
+
+            if points.shape[0] > 2:
+                box = self.unclip(points, unclip_ratio=2.0)    # 因为得到的分割结果是文本收缩区域，因此需要进行一定程度扩张
+                if len(box) != 1:
+                    continue
+            else:
+                continue
+
+            box = box.reshape(-1, 2)
+            mini_box, sside = self.get_mini_boxes(box.reshape((-1, 1, 2)))   # 计算最小外接矩形
+            if sside < self.min_size + 2:
+                continue
+
+
+            if not isinstance(dest_width, int):
+                dest_width = dest_width.item()
+                dest_height = dest_height.item()
+
+            mini_box[:, 0] = np.clip(np.round(mini_box[:, 0] / width * dest_width), 0, dest_width)       # 尺寸与原图对齐
+            mini_box[:, 1] = np.clip(np.round(mini_box[:, 1] / height * dest_height), 0, dest_height)
+            boxes.append(mini_box.tolist())
+            scores.append(score)
+        return boxes, scores
+```
+
+### 测试图片处理
+
+这段代码包含两个图像处理函数：
+
+1. **`resize_image` 函数**：这个函数对图像进行缩放，使其最短边达到预设的长度。如果图像的高度小于宽度，则将高度调整为预设长度，然后根据原始图像的尺寸比例缩放宽度；反之亦然。最后，确保缩放后的宽度和高度都是32的倍数，这通常有助于某些模型的运算效率。
+
+2. **`load_test_image` 函数**：这个函数用于加载测试图像并进行预处理。它首先使用OpenCV加载图像，然后调用`resize_image`函数对图像进行缩放。接下来，将RGB均值减去每个像素的RGB均值，然后将像素值除以255进行归一化。最后，将图像转换为PyTorch张量，并调整通道顺序以适应模型输入的格式。
+
+这些函数组合起来，能够加载和预处理测试图像，使其适用于模型输入。
+
+```python
+# 测试图片处理
+def resize_image(img):
+    # 图像最短边设定为预设长度，长边根据原图尺寸比例进行缩放
+    height, width, _ = img.shape
+    if height < width:
+        new_height = det_args.test_img_short_side
+        new_width = int(math.ceil(new_height / height * width / 32) * 32)
+    else:
+        new_width = det_args.test_img_short_side
+        new_height = int(math.ceil(new_width / width * height / 32) * 32)
+    resized_img = cv2.resize(img, (new_width, new_height))
+    return resized_img
+
+def load_test_image(image_path):
+    RGB_MEAN = np.array([122.67891434, 116.66876762, 104.00698793])
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR).astype('float32')
+    original_shape = img.shape[:2]
+    img = resize_image(img)
+    img -= RGB_MEAN
+    img /= 255.
+    img = torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0)
+    return img, original_shape
+```
+
+### 检测结果输出
+
+这段代码负责将检测结果格式化输出到文本文件中。
+
+- `det_res_dir` 是输出结果的目录。
+- `batch` 包含了一个批次的图像信息，其中可能包括图像的文件名、尺寸等。
+- `output` 是模型的输出结果，包括检测到的文本框坐标和对应的置信度得分。
+
+函数首先遍历每张图像，获取原始图像的形状和文件名等信息。然后，根据文件名生成输出结果的文件路径。接着，对于每个检测到的文本框，将其坐标和对应的置信度得分写入到结果文件中。最终，每个文本框的信息都以逗号分隔，并写入一行。
+
+这样，每张输入图像都会对应一个输出的文本文件，文件中包含了检测到的文本框的坐标和置信度得分。
+
+```python
+# 检测结果输出
+def format_output(det_res_dir, batch, output):
+    batch_boxes, batch_scores = output
+    for index in range(batch['image'].size(0)):
+        original_shape = batch['shape'][index]
+        filename = batch['filename'][index]
+        result_file_name = 'det_res_' + filename.split('/')[-1].split('.')[0] + '.txt'
+        result_file_path = os.path.join(det_res_dir, result_file_name)
+        boxes = batch_boxes[index]
+        scores = batch_scores[index]
+        with open(result_file_path, 'wt') as res:
+            for i, box in enumerate(boxes):
+                box = np.array(box).reshape(-1).tolist()
+                result = ",".join([str(int(x)) for x in box])
+                score = scores[i]
+                res.write(result + ',' + str(score) + "\n")
+```
+
+### 测试
+
+#### 函数定义
+
+这段代码是用于进行读数区域检测的测试的函数。下面是函数的主要步骤：
+
+1. **模型加载**：加载之前训练的读数区域检测模型。
+
+2. **后处理**：创建一个 `SegDetectorRepresenter` 的实例，用于对模型输出进行后处理，得到最终的文本框坐标和置信度得分。
+
+3. **推理**：遍历测试图像目录中的每张图像，对每张图像进行推理。首先加载图像并进行预处理，然后将其传递给模型进行推理，得到模型输出。接着，使用后处理方法获取最终的文本框结果，并将结果格式化输出到文本文件中。
+
+4. **结果保存**：将输出的文本结果保存到指定的目录中。
+
+这个函数的作用是对测试集中的图像进行文本检测，并将检测结果保存到文件中。
+
+```python
+def det_test():
+    # 模型加载
+    model = SegDetectorModel(device)
+    model.load_state_dict(torch.load(det_args.saved_model_path, map_location=device), strict=False)
+    model.eval()
+
+    # 后处理
+    representer = SegDetectorRepresenter(thresh=det_args.thresh, box_thresh=det_args.box_thresh, max_candidates=det_args.max_candidates)
+
+    # 推理
+    os.makedirs(det_args.det_res_dir, exist_ok=True)
+    batch = dict()
+    cnt = 0
+    with torch.no_grad():
+        for file in tqdm(os.listdir(det_args.test_dir)):
+            img_path = os.path.join(det_args.test_dir, file)
+            image, ori_shape = load_test_image(img_path)
+            batch['image'] = image
+            batch['shape'] = [ori_shape]
+            batch['filename'] = [file]
+            pred = model.forward(batch, training=False)
+            output = representer.represent(batch, pred)
+            format_output(det_args.det_res_dir, batch, output)
+
+
+            #if DEBUG and cnt >= 6:    # DEBUG
+                #break
+            cnt += 1
+```
+
+#### 测试结果可视化
+
+这段代码用于将文本检测的结果可视化，以便直观地查看模型的检测效果。主要步骤如下：
+
+1. **创建可视化结果保存目录**：指定一个目录用于保存可视化结果。
+
+2. **遍历检测结果文件**：遍历文本检测结果目录中的每个结果文件。
+
+3. **加载图像**：根据检测结果文件的文件名加载相应的原始图像。
+
+4. **读取检测结果**：从对应的检测结果文件中读取文本框的坐标信息。
+
+5. **绘制文本框**：将检测到的文本框绘制在原始图像上。
+
+6. **保存结果图像**：将带有文本框的图像保存到可视化结果目录中。
+
+7. **可视化显示**：选择前5张图像进行显示，并将它们显示在一个大的画布中，以便观察检测效果。
+
+这样，可以通过可视化结果来验证文本检测模型的性能，以及检查其在不同图像上的表现。
+
+```python
+# 检测结果可视化
+test_dir = 'data/test_imgs'
+det_dir = 'temp/det_res'
+det_vis_dir = 'temp/det_vis_test'
+
+
+os.makedirs(det_vis_dir, exist_ok=True)
+label_files = os.listdir(det_dir)
+cnt = 0
+plt.figure(figsize=(60,60))
+for label_file in tqdm(label_files):
+    if not label_file.endswith('.txt'):
+        continue
+    image = cv2.imread(os.path.join(test_dir, label_file.replace('det_res_', '')[:-4] + '.jpg'))
+
+    with open(os.path.join(det_dir, label_file), 'r') as f:
+        lines = f.readlines()
+
+    save_name = label_file.replace('det_res_', '')[:-4]+'.jpg'
+    if len(lines) == 0:
+        cv2.imwrite(os.path.join(det_vis_dir, save_name), image)
+    else:
+        line = lines[0].strip().split(',')
+        locs = [float(t) for t in line[:8]]
+
+
+        # draw box
+        locs = np.array(locs).reshape(1, -1, 2).astype(np.int32)
+        image = cv2.imread(os.path.join(test_dir, label_file.replace('det_res_', '')[:-4] + '.jpg'))
+        cv2.polylines(image, locs, True, (255, 255, 0), 8)
+
+        # save images
+        save_name = label_file.replace('det_res_', '')[:-4]+'.jpg'
+        cv2.imwrite(os.path.join(det_vis_dir, save_name), image)
+
+    if cnt < 5:    # 只画5张
+        plt.subplot(151 + cnt)
+        plt.title(save_name, fontdict={'size': 60})
+        plt.xticks([])
+        plt.yticks([])
+        plt.imshow(image)
+        cnt += 1
+```
+
+#### 显示效果
+
+由于训练批次较少，第一张和第五张图片的识别效果欠佳
+
+![image](https://github.com/LouisMao666/meter-identify/assets/149593046/ff14f168-5f10-441e-849d-3f70a182fef3)
+
+## 第二部分：水表读数识别
+
+这部分我们处理的对象，已经从整张图片变成了切割完成的读数区域，那么问题也就变得简单，相信大家初学时都练习过MNIST数据集，二者本质上非常接近。
+
+### 参数设定
+
+这个类定义了用于文本识别任务的参数选项，以下是每个参数的含义和默认值：
+
+1. `height`：图像的高度，用于输入文本识别模型的图像高度，默认值为32。
+
+2. `width`：图像的宽度，用于输入文本识别模型的图像宽度，默认值为100。
+
+3. `voc_size`：字符的数量，包括文本中可能出现的字符以及额外的用于填充的字符（PADDING位），默认值为21。
+
+4. `decoder_sdim`：解码器（decoder）的隐藏状态的维度，默认值为512。
+
+5. `max_len`：文本的最大长度，默认值为5。
+
+6. `lr`：初始学习率，默认值为1.0。
+
+7. `milestones`：在训练过程中降低学习率的里程碑（epoch数），默认值为[40, 60]，即在第40和第60个epoch时降低学习率。
+
+8. `max_epoch`：训练的最大epoch数，默认值为80。
+
+9. `batch_size`：训练时的批次大小，默认值为64。
+
+10. `num_workers`：用于数据加载的线程数，默认值为0。
+
+11. `print_interval`：打印训练信息的间隔（单位：batch），默认值为25。
+
+12. `save_interval`：保存模型的间隔（单位：batch），默认值为125。
+
+13. `train_dir`：训练数据集的目录路径，默认值为'temp/rec_datasets/train_imgs'。
+
+14. `test_dir`：测试数据集的目录路径，默认值为'temp/rec_datasets/test_imgs'。
+
+15. `save_dir`：保存训练好的模型的目录路径，默认值为'temp/rec_models/'。
+
+16. `saved_model_path`：加载已保存的模型的路径，默认值为'temp/rec_models/checkpoint_final'。
+
+17. `rec_res_dir`：文本识别结果的保存目录，默认值为'temp/rec_res/'。
+
+这些参数提供了在进行文本识别任务时可能需要调整的各种选项，并且每个参数都有默认值，因此在大多数情况下可以直接使用默认设置进行训练或测试。
+
+```python
+class RecOptions():
+    def __init__(self):
+        self.height = 32              # 图像尺寸
+        self.width = 100
+        self.voc_size = 21            # 字符数量 '0123456789ABCDEFGHIJ' + 'PADDING'位
+        self.decoder_sdim = 512
+        self.max_len = 5              # 文本长度
+        self.lr = 1.0
+        self.milestones = [40, 60]    # 在第 40 和 60 个 epoch 训练时降低学习率
+        self.max_epoch = 80
+        self.batch_size = 64
+        self.num_workers = 0
+        self.print_interval = 25
+        self.save_interval = 125
+        self.train_dir = 'temp/rec_datasets/train_imgs'
+        self.test_dir = 'temp/rec_datasets/test_imgs'
+        self.save_dir = 'temp/rec_models/'
+        self.saved_model_path = 'temp/rec_models/checkpoint_final'
+        self.rec_res_dir = 'temp/rec_res/'
+
+
+    def set_(self, key, value):
+        if hasattr(self, key):
+            setattr(self, key, value)
+
+
+rec_args = RecOptions()
+```
+
+### 数据预处理
+
+文本识别训练数据的预处理，包括标签处理和构造识别训练数据。
+
+1. **标签处理**：根据预定义的半字符类别字典`EXT_CHARS`，对多个字符的情况进行处理。如果标签中包含多个字符，算法会检查每个字符的相同位置是否相同。如果相同位置的字符相同，则将其保留；如果相同位置的字符不同，则根据`EXT_CHARS`字典将其映射到半字符类别中。处理完成后得到一个新的标签`ext_word`。
+
+2. **图像调整**：根据文本的倾斜角度，将倾斜的文字图像调整为水平图像。这里使用透视变换`cv2.warpPerspective`来实现调整。首先计算倾斜文字图像的宽度`w`和高度`h`，然后根据透视变换矩阵`M`将倾斜的文字图像调整为水平图像。
+
+3. **保存处理后的图像**：将处理后的文本图像保存到指定的目录中，文件名由原始文件名、半字符类别和`.jpg`后缀组成。
+
+这样，通过预处理代码，可以构造出适合文本识别模型训练的数据集。
+
+```python
+标签处理：定义新字符类处理半字符的情况，比如将'0-1半字符'归到'A'类，减小歧义
+识别训练数据构造：从完整图像中裁剪出文本图像作为识别模型输入数据
+'''
+def PreProcess():
+    EXT_CHARS = {
+        '01': 'A', '12': 'B', '23': 'C', '34': 'D', '45': 'E',
+        '56': 'F', '67': 'G', '78': 'H', '89': 'I', '09': 'J'
+    }
+
+
+    train_dir = 'data/train_imgs'
+    train_labels_dir = 'data/labels'
+    word_save_dir = 'temp/rec_datasets/train_imgs'      # 保存识别训练数据集
+    os.makedirs(word_save_dir, exist_ok=True)
+    label_files = os.listdir(train_labels_dir)
+    for label_file in tqdm(label_files):
+        with open(os.path.join(train_labels_dir, label_file), 'r') as f:
+            lines = f.readlines()
+        line = lines[0].strip().split()
+        locs = line[:8]
+        words = line[8:]
+
+        # 标签处理
+        if len(words) == 1:
+            ext_word = words[0]
+        else:
+            assert len(words) % 2 == 0
+            ext_word = ''
+            for i in range(len(words[0])):
+                char_i = [word[i] for word in words]
+                if len(set(char_i)) == 1:
+                    ext_word += char_i[0]
+                elif len(set(char_i)) == 2:
+                    char_i = list(set(char_i))
+                    char_i.sort()
+                    char_i = ''.join(char_i)
+                    ext_char_i = EXT_CHARS[char_i]
+                    ext_word += ext_char_i
+
+
+        locs = [int(t) for t in line[:8]]
+
+        # 将倾斜文字图像调整为水平图像
+        x1, y1, x2, y2, x3, y3, x4, y4 = locs
+        w = int(0.5 * (((x2-x1)**2+(y2-y1)**2)**0.5 + ((x4-x3)**2+(y4-y3)**2)**0.5))
+        h = int(0.5 * (((x2-x3)**2+(y2-y3)**2)**0.5 + ((x4-x1)**2+(y4-y1)**2)**0.5))
+        src_points = np.array([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], dtype='float32')
+        dst_points = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype='float32')
+        M = cv2.getPerspectiveTransform(src_points, dst_points)
+        image = cv2.imread(os.path.join(train_dir, label_file.replace('.txt', '.jpg')))
+        word_image = cv2.warpPerspective(image, M, (w, h))
+
+        # save images
+        cv2.imwrite(os.path.join(word_save_dir, label_file.replace('.txt', '')+'_'+ext_word+'.jpg'), word_image)
+
+
+# 运行识别训练数据前处理代码
+PreProcess()
+```
+
+### 数据集导入方法
+
+这个类用于构建一个数据集，用于训练文本识别模型。以下是这个类的主要功能和属性：
+
+1. **`__init__` 方法**：初始化函数，用于设置数据集的参数和加载数据。参数包括数据集目录 `data_dir`、文本最大长度 `max_len`、图像尺寸调整参数 `resize_shape` 和是否用于训练 `train`。在初始化过程中，会遍历数据集目录，获取所有图像文件的路径和对应的文本标签，并生成标签映射字典。
+
+2. **`__len__` 方法**：返回数据集的大小，即图像的数量。
+
+3. **`gen_labelmap` 方法**：静态方法，用于生成字符和数字标签的对应字典。其中，将字符映射到数字标签，同时将填充字符（PADDING）映射到0。
+
+4. **`__getitem__` 方法**：获取数据集中指定索引的图像和标签。首先根据索引获取图像路径和对应的文本标签，然后根据文本标签构建标签向量。如果数据用于训练且存在数据增强操作，则对图像进行数据增强。最后将图像、标签向量和标签长度作为输出返回。
+
+这个类提供了一个数据集对象，可以用于加载训练或测试数据，并根据需要进行数据增强操作。
+
+```python
+# data
+class WMRDataset(data.Dataset):
+    def __init__(self, data_dir=None, max_len=5, resize_shape=(32, 100), train=True):
+        super(WMRDataset, self).__init__()
+        self.data_dir = data_dir
+        self.max_len = max_len
+        self.is_train = train
+
+        self.targets = [[os.path.join(data_dir, t), t.split('_')[-1][:5]] for t in os.listdir(data_dir) if t.endswith('.jpg')]
+        self.PADDING, self.char2id, self.id2char = self.gen_labelmap()
+
+        # 数据增强
+        self.transform = transforms.Compose([
+            transforms.Resize(resize_shape),
+            transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+            # 可以添加更多的数据增强操作，比如 gaussian blur、shear 等
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.targets)
+
+    @staticmethod
+    def gen_labelmap(charset='0123456789ABCDEFGHIJ'):
+        # 构造字符和数字标签对应字典
+        PADDING = 'PADDING'
+        char2id = {t:idx for t, idx in zip(charset, range(1, 1+len(charset)))}
+        char2id.update({PADDING:0})
+        id2char = {v:k for k, v in char2id.items()}
+        return PADDING, char2id, id2char
+
+
+
+    def __getitem__(self, index):
+        assert index <= len(self), 'index range error'
+        img_path = self.targets[index][0]
+        word = self.targets[index][1]
+        img = Image.open(img_path)
+
+        label = np.full((self.max_len,), self.char2id[self.PADDING], dtype=np.int0)
+        label_list = []
+        word = word[:self.max_len]
+        for char in word:
+            label_list.append(self.char2id[char])
+
+        label_len = len(label_list)
+        assert len(label_list) <= self.max_len
+        label[:len(label_list)] = np.array(label_list)
+
+        if self.transform is not None and self.is_train:
+            img = self.transform(img)
+            img.sub_(0.5).div_(0.5)
+
+        label_len = np.array(label_len).astype(np.int32)
+        label = np.array(label).astype(np.int32)
+
+        return img, label, label_len        # 输出图像、文本标签、标签长度, 计算 CTC loss 需要后两者信息
+```
+
+调用这个类
+
+这段代码是使用定义的 WMRDataset 类构建数据集，并使用 PyTorch 的 DataLoader 创建数据加载器，然后获取一个批次的数据，并对图像进行可视化。
+
+具体步骤如下：
+
+构建数据集对象：使用 WMRDataset 类构建数据集对象 dataset，并传入训练数据集的目录、文本最大长度、图像尺寸调整参数和是否用于训练的标志。
+
+创建数据加载器：使用 DataLoader 类创建数据加载器 train_dataloader，并传入数据集对象、批次大小、是否对数据进行洗牌、是否将数据加载到 GPU 的钉住内存中以加速训练、是否丢弃最后一个不完整的批次。
+
+获取一个批次的数据：使用 iter(train_dataloader) 获取数据加载器的迭代器，并调用 next 方法获取一个批次的数据，包括图像、标签和标签长度。
+
+图像可视化：将获取的图像数据进行可视化，并添加标题“image”。
+
+标签解码：将标签从数字表示转换为字符串表示，并打印出来。
+
+请注意，在将图像数据从张量转换为 NumPy 数组时，需要进行适当的缩放和格式转换，以便将其显示为图像。同时，将标签从数字表示转换为字符串表示时，需要使用数据集对象中定义的映射关系。
+
+```python
+dataset = WMRDataset(rec_args.train_dir, max_len=5, resize_shape=(rec_args.height, rec_args.width), train=True)
+train_dataloader = data.DataLoader(dataset, batch_size=2, shuffle=True, pin_memory=True, drop_last=False)
+batch = next(iter(train_dataloader))
+
+
+image, label, label_len = batch
+image = ((image[0].permute(1, 2, 0).to('cpu').numpy() * 0.5 + 0.5) * 255).astype(np.uint8)
+plt.title('image')
+plt.xticks([])
+plt.yticks([])
+plt.imshow(image)
+
+label_digit = label[0].to('cpu').numpy().tolist()
+label_str = ''.join([dataset.id2char[t] for t in label_digit if t > 0])
+
+
+print('label_digit: ', label_digit)
+print('label_str: ', label_str)
+```
+
+#### 输出：
+
+为了提高训练效率 这里使用的坐标并不是上一部分计算得出的，而是数据集中自带的正确坐标，将训练分为两个部分进行可以显著调高效率
+
+读数区域的坐标 读数 显示读数区域
+
+![2024-02-25](https://github.com/LouisMao666/meter-identify/assets/149593046/4846dca6-d8aa-4ab9-98c3-c76c3e5b178d)
+
+
+
+
 
 
 
